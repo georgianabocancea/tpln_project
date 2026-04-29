@@ -1,0 +1,41 @@
+# Virtual environment
+.venv/
+
+# Large data files — never commit
+data/raw/
+data/embeddings/
+models/
+*.bin
+*.vec
+*.pt
+*.ckpt
+
+# Processed outputs
+data/processed/
+
+# Hugging Face cache
+~/.cache/huggingface/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Streamlit
+.streamlit/
+
