@@ -60,11 +60,9 @@ def _antonym_lemmas(lemma: str) -> frozenset:
     wn = _get_wn()
     antonyms: Set[str] = set()
     for syn in _synsets_for_lemma(lemma):
-        for lemma_obj in syn.lemmas(lang=_LANG):
-            for ant in lemma_obj.antonyms():
-                # antonyms() returns Lemma objects; get Spanish forms
-                ant_syn = ant.synset()
-                for es_lemma in ant_syn.lemmas(lang=_LANG):
+        for en_lemma in syn.lemmas():
+            for ant in en_lemma.antonyms():
+                for es_lemma in ant.synset().lemmas(lang=_LANG):
                     antonyms.add(es_lemma.name().lower().replace("_", " "))
     return frozenset(antonyms)
 
