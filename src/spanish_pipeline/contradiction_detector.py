@@ -96,6 +96,13 @@ def _shared_topic_word(a, b) -> Optional[str]:
 def _claims_are_related(a, b, require_evidence: bool = False) -> bool:
     if _same_predicate(a, b) and _similar_subject(a, b):
         return True
+    
+    # FIX: same subject is enough to consider the claims are related
+    if _similar_subject(a, b):
+        if require_evidence:
+            return bool(a.numerics or a.temporals) and bool(b.numerics or b.temporals)
+        return True
+    
     topic = _shared_topic_word(a, b)
     if topic:
         if require_evidence:
