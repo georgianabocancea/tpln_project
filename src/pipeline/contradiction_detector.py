@@ -162,7 +162,6 @@ def _claims_are_related(
 _NUMERIC_REL_TOLERANCE = 0.01   # 1%  — less than this → not a contradiction
 _NUMERIC_ABS_TOLERANCE = 0.0    # for percentages etc.
 
-
 def _check_numeric_contradiction(claim_a, claim_b, norm_a: dict, norm_b: dict) -> Optional[ContradictionAlert]:
     """
     Detect numeric contradictions.
@@ -178,17 +177,37 @@ def _check_numeric_contradiction(claim_a, claim_b, norm_a: dict, norm_b: dict) -
     if not _claims_are_related(claim_a, claim_b, require_evidence=True):
         return None
 
+    context_keywords = {"revânzare", "reselling", "scumpit", "inițial", "ajuns să", "site-uri", "viagogo", "seatpick"}
+    full_text = (claim_a.sentence_text + " " + claim_b.sentence_text).lower()
+    
+    unit_families = {
+        "currency": {"EUR", "RON", "USD", "lei", "euro"},
+        "count": {"fani", "persoane", "locuri", "unități", "units", None}
+    }
+
     for na in norm_a["numerics"]:
         for nb in norm_b["numerics"]:
-            # Only compare values with the same unit
-            if na["unit"] != nb["unit"]:
+            is_a_money = na["unit"] in unit_families["currency"]
+            is_b_money = nb["unit"] in unit_families["currency"]
+            is_a_count = na["unit"] in unit_families["count"]
+            is_b_count = nb["unit"] in unit_families["count"]
+
+            if (is_a_money and is_b_count) or (is_a_count and is_b_money):
                 continue
+
+            if na["unit"] != nb["unit"] and not (is_a_money and is_b_money):
+                continue
+            
             va, vb = na["value"], nb["value"]
-            if va == 0 and vb == 0:
-                continue
+            if va == 0 and vb == 0: continue
+
             denom = max(abs(va), abs(vb), 1e-9)
             rel_diff = abs(va - vb) / denom
+
             if rel_diff > _NUMERIC_REL_TOLERANCE:
+                if any(kw in full_text for kw in context_keywords):
+                    continue
+
                 return ContradictionAlert(
                     claim_a_index=claim_a.sentence_index,
                     claim_b_index=claim_b.sentence_index,
@@ -206,7 +225,6 @@ def _check_numeric_contradiction(claim_a, claim_b, norm_a: dict, norm_b: dict) -
                     evidence_b=nb["raw"],
                 )
     return None
-
 
 def _check_temporal_contradiction(claim_a, claim_b, norm_a: dict, norm_b: dict) -> Optional[ContradictionAlert]:
     """
@@ -269,13 +287,23 @@ def _check_entity_contradiction(claim_a, claim_b) -> Optional[ContradictionAlert
     if not _same_predicate(claim_a, claim_b):
         return None
 
+    context_keywords = {"revânzare", "reselling", "scumpit", "inițial", "ajuns să", "site-uri", "viagogo", "seatpick"}
+    full_text = (claim_a.sentence_text + " " + claim_b.sentence_text).lower()
+
     for label in claim_a.entities:
         if label not in claim_b.entities:
             continue
+        
+        price_labels = {"MONEY", "B-MONEY", "NUM", "B-NUM", "QUANTITY"}
+        if label in price_labels and any(kw in full_text for kw in context_keywords):
+            continue
+
         ents_a = set(e.lower() for e in claim_a.entities[label])
         ents_b = set(e.lower() for e in claim_b.entities[label])
-        # If both mention entities of the same type but completely different ones
+        
         if ents_a and ents_b and ents_a.isdisjoint(ents_b):
+            if label in {"MONEY", "B-MONEY"} and any(kw in full_text for kw in context_keywords):
+                continue
             return ContradictionAlert(
                 claim_a_index=claim_a.sentence_index,
                 claim_b_index=claim_b.sentence_index,

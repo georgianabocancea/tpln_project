@@ -19,6 +19,8 @@ import logging
 from functools import lru_cache
 from typing import Optional, Set, List, Tuple
 
+from pyarrow.acero import exc
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -162,7 +164,7 @@ class WordNetChecker:
         except Exception as exc:
             logger.debug("Antonym lookup failed for '%s': %s", lemma_a, exc)
 
-        # --- Check 2: Negated synonym ---
+        # --- Check 2: Negated synonym contradiction ---
         try:
             neg_a = _is_negated(claim_a)
             neg_b = _is_negated(claim_b)
@@ -172,8 +174,27 @@ class WordNetChecker:
                 syn_a = _synonym_lemmas(lemma_a)
                 syn_b = _synonym_lemmas(lemma_b)
 
-                # lemma_b is a synonym of (un-negated) lemma_a or vice versa
                 if lemma_b in syn_a or lemma_a in syn_b or lemma_a == lemma_b:
+            
+                    # NEW: verify that the objects are semantically similar
+                    # before reporting a contradiction — prevents false positives
+                    # where the same predicate is negated in completely different contexts
+                    obj_a = (claim_a.object_lemma or "").lower()
+                    obj_b = (claim_b.object_lemma or "").lower()
+            
+                    # If both claims have objects, they must overlap or be similar
+                    if obj_a and obj_b and obj_a != obj_b:
+                        # Check if there's any lexical overlap between objects
+                        words_a = set(obj_a.split())
+                        words_b = set(obj_b.split())
+                        if not words_a & words_b:
+                            # Objects are completely different — likely different contexts
+                            logger.debug(
+                                "Skipping negated-synonym: objects differ ('%s' vs '%s')",
+                                obj_a, obj_b
+                            )
+                            return None
+
                     negated_claim = claim_a if neg_a else claim_b
                     positive_claim = claim_b if neg_a else claim_a
                     return {

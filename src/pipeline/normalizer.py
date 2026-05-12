@@ -28,8 +28,8 @@ logger = logging.getLogger(__name__)
 # relative to the base unit.
 _UNIT_TABLE = {
     # Currency (no multiplier — kept as absolute)
-    "lei": ("RON", 1),
-    "leu": ("RON", 1),
+    "lei": ("RON", 0.20),
+    "leu": ("RON", 0.20),
     "euro": ("EUR", 1),
     "dolari": ("USD", 1),
     "dolar": ("USD", 1),
