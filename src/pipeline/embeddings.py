@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import os
 import logging
+from functools import lru_cache
 import numpy as np
 from typing import List, Optional, Tuple
 
@@ -158,6 +159,11 @@ def sentence_embedding_bert(text: str) -> np.ndarray:
     return pooled.squeeze(0).numpy()
 
 
+@lru_cache(maxsize=512)
+def _cached_sentence_embedding_bert(text: str) -> np.ndarray:
+    return sentence_embedding_bert(text)
+
+
 def cosine_similarity(vec_a: np.ndarray, vec_b: np.ndarray) -> float:
     """Compute cosine similarity between two numpy vectors."""
     norm_a = np.linalg.norm(vec_a)
@@ -189,6 +195,7 @@ class EmbeddingService:
 
     def __init__(self, use_bert: bool = False, static_model_path: Optional[str] = None):
         self.use_bert = use_bert
+        self.static_model_path = static_model_path
         if static_model_path and os.path.isfile(static_model_path):
             load_static_embeddings(static_model_path)
         elif static_model_path:
@@ -207,18 +214,33 @@ class EmbeddingService:
             return word_similarity(lemma_a, lemma_b)
         return 0.0
 
+    def claim_similarity_static(self, text_a: str, text_b: str) -> float:
+        """Return cosine similarity between two claim signatures using static embeddings."""
+        vec_a = sentence_vector_static(text_a)
+        vec_b = sentence_vector_static(text_b)
+        if vec_a is None or vec_b is None:
+            return 0.0
+        return cosine_similarity(vec_a, vec_b)
+
     def claim_similarity_bert(self, text_a: str, text_b: str) -> float:
         """
         Return sentence-level cosine similarity between two claim texts using BERT.
         Loads BERT on first call (lazy).
         """
         try:
-            vec_a = sentence_embedding_bert(text_a)
-            vec_b = sentence_embedding_bert(text_b)
+            vec_a = _cached_sentence_embedding_bert(text_a)
+            vec_b = _cached_sentence_embedding_bert(text_b)
             return cosine_similarity(vec_a, vec_b)
         except Exception as exc:
             logger.warning("BERT similarity failed: %s", exc)
             return 0.0
+
+    @staticmethod
+    def _claim_text(claim) -> str:
+        parts = [claim.subject, claim.predicate, claim.object]
+        qualifiers = getattr(claim, "qualifiers", None) or []
+        parts.extend(qualifiers)
+        return " ".join(part.strip() for part in parts if part and part.strip())
 
     def claims_are_semantically_related(
         self,
@@ -240,10 +262,18 @@ class EmbeddingService:
         if pred_sim >= predicate_threshold:
             return True
 
+        text_a = self._claim_text(claim_a)
+        text_b = self._claim_text(claim_b)
+        if not text_a or not text_b:
+            return False
+
+        if _static_model is not None:
+            static_sim = self.claim_similarity_static(text_a, text_b)
+            if static_sim >= sentence_threshold:
+                return True
+
         if self.use_bert:
-            sent_sim = self.claim_similarity_bert(
-                claim_a.sentence_text, claim_b.sentence_text
-            )
+            sent_sim = self.claim_similarity_bert(text_a, text_b)
             if sent_sim >= sentence_threshold:
                 return True
 

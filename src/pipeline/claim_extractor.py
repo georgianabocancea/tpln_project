@@ -3,10 +3,12 @@ claim_extractor.py
 ------------------
 Phase 2 — Extract structured claims from dependency-parsed Romanian sentences.
 
-A claim is a Subject–Predicate–Object (SPO) triplet, optionally enriched with:
-  - numerical values (with units)
-  - temporal expressions
-  - named entities
+A claim is a compact claim frame centered on a predicate, enriched with:
+    - subject / object spans
+    - attached modifiers and other descriptive POS tags
+    - numerical values (with units)
+    - temporal expressions
+    - named entities
 
 Input:  List[Sentence]  (output of RomanianPreprocessor)
 Output: List[Claim]
@@ -42,6 +44,7 @@ class TemporalAttribute:
 class Claim:
     sentence_index: int
     sentence_text: str
+    qualifiers: List[str] = field(default_factory=list)
 
     # Core SPO
     subject: Optional[str] = None
@@ -59,7 +62,7 @@ class Claim:
     def __repr__(self):
         return (
             f"Claim(subj='{self.subject}', pred='{self.predicate}', "
-            f"obj='{self.object}', nums={self.numerics}, "
+            f"obj='{self.object}', quals={self.qualifiers}, nums={self.numerics}, "
             f"temps={self.temporals}, ents={self.entities})"
         )
 
@@ -83,6 +86,13 @@ VERB_POS = {"VERB", "AUX"}
 
 # POS tags for nouns / pronouns
 NOUN_POS = {"NOUN", "PROPN", "PRON"}
+
+PREDICATE_ROOT_POS = {"ADJ", "NOUN", "PROPN"}
+CLAIM_MODIFIER_DEPS = {
+    "det", "amod", "nummod", "nmod", "nmod:poss", "advmod", "case",
+    "flat", "flat:name", "compound", "appos", "acl", "advcl", "neg",
+    "mark", "fixed", "conj", "cc", "aux", "cop",
+}
 
 # ---------------------------------------------------------------------------
 # Numeric patterns (Romanian)
@@ -124,6 +134,8 @@ _TEMPORAL_RE = re.compile(
         |(?:primul?|al\s+doilea?|al\s+treilea?|al\s+patrulea?)
          \s+trimestru                                      # "primul trimestru"
         |(?:luni?|marți|miercuri|joi|vineri|sâmbătă|duminică)  # day names
+
+
         |ieri|azi|astăzi|mâine|acum                        # relative
     )\b
     """,
@@ -179,6 +191,47 @@ def _collect_span(tokens, root_idx: int, visited=None) -> List[str]:
         if tok:
             texts.append(tok.text)
     return texts
+
+
+def _is_copular_auxiliary(token, tokens) -> bool:
+    parent = _get_token_by_id(tokens, token.head)
+    if not parent:
+        return False
+    return token.dep in {"cop", "aux"} and parent.pos in PREDICATE_ROOT_POS
+
+
+def _predicate_candidates(tokens):
+    candidates = []
+    seen = set()
+    for tok in tokens:
+        if tok.pos in VERB_POS:
+            if _is_copular_auxiliary(tok, tokens):
+                continue
+            if tok.index not in seen:
+                candidates.append(tok)
+                seen.add(tok.index)
+        elif tok.head == 0 and tok.pos in PREDICATE_ROOT_POS:
+            if tok.index not in seen:
+                candidates.append(tok)
+                seen.add(tok.index)
+    return candidates
+
+
+def _extract_qualifiers(tokens, predicate_idx: int, used_indices: set[int]) -> List[str]:
+    qualifiers: List[str] = []
+    seen = set()
+    for child in tokens:
+        if child.head != predicate_idx:
+            continue
+        if child.index in used_indices or child.dep not in CLAIM_MODIFIER_DEPS:
+            continue
+        span = " ".join(_collect_span(tokens, child.index))
+        if span:
+            key = span.lower()
+            if key not in seen:
+                qualifiers.append(span)
+                seen.add(key)
+    return qualifiers
 
 
 def _extract_numerics(text: str) -> List[NumericAttribute]:
@@ -242,67 +295,121 @@ def _extract_entities(tokens) -> Dict[str, List[str]]:
 # Core extraction logic
 # ---------------------------------------------------------------------------
 
+def _extract_role_qualifiers(tokens, role_root_idx: int, used_indices: set) -> List[str]:
+    """
+    Extract qualifiers attached to a subject or object node:
+    adjectival modifiers (amod), prepositional phrases (nmod + case),
+    appositions (appos), numeric modifiers (nummod), adverbials (advmod).
+
+    These enrich the claim with attributes beyond the bare head noun,
+    e.g. 'creștere economică de 3%' instead of just 'creștere'.
+    """
+    ROLE_QUALIFIER_DEPS = {
+        "amod",       # adjectival modifier: 'creștere economică'
+        "nummod",     # numeric modifier:    'trei milioane'
+        "nmod",       # nominal modifier:    'profitul companiei'
+        "nmod:poss",  # possessive:          'profitul său'
+        "appos",      # apposition:          'Ion Popescu, ministrul'
+        "advmod",     # adverbial:           'mult mai mare'
+        "acl",        # adjectival clause:   'suma declarată'
+        "flat:name",  # flat name:           'Ion Popescu'
+        "flat",       # flat compound:       compound proper nouns
+    }
+
+    qualifiers: List[str] = []
+    seen_spans: set = set()
+
+    for child in tokens:
+        if child.head != role_root_idx:
+            continue
+        if child.dep not in ROLE_QUALIFIER_DEPS:
+            continue
+        # Collect the full span of this qualifier (e.g. 'de 3 milioane de euro')
+        span_indices = _collect_span_indices(tokens, child.index)
+        # Skip if already captured as part of subject/object
+        if span_indices and span_indices[0] in used_indices:
+            continue
+        span_text = " ".join(
+            tok.text for idx in span_indices
+            for tok in [_get_token_by_id(tokens, idx)] if tok
+        )
+        if span_text and span_text.lower() not in seen_spans:
+            qualifiers.append(span_text)
+            seen_spans.add(span_text.lower())
+
+    return qualifiers
 
 def _extract_claims_from_sentence(sentence) -> List[Claim]:
-    """
-    Extract SPO claims from a single Sentence object.
-
-    Strategy:
-      1. Find all VERB tokens (potential predicates).
-      2. For each verb, find its nsubj (subject) and obj/obl (object) dependents.
-      3. Collect NP spans for subject and object.
-      4. Attach numeric, temporal, and NE attributes to the claim.
-    """
-    from src.pipeline.preprocessor import Sentence, Token  # avoid circular import
-
+    """Extract claim frames from a single Sentence object."""
     tokens = sentence.tokens
     claims: List[Claim] = []
 
-    # Index tokens by their id for fast lookup
-    tok_by_id = {t.index: t for t in tokens}
+    for predicate in _predicate_candidates(tokens):
+        children = [t for t in tokens if t.head == predicate.index]
 
-    # Find all verb tokens
-    verb_tokens = [t for t in tokens if t.pos in VERB_POS]
-
-    for verb in verb_tokens:
-        # Find direct children
-        children = [t for t in tokens if t.head == verb.index]
-
-        subject_span = []
-        subject_lemma = None
-        object_span = []
-        object_lemma = None
+        subject_span: List[str] = []
+        subject_lemma: Optional[str] = None
+        object_span: List[str] = []
+        object_lemma: Optional[str] = None
+        subject_child = None
+        object_child = None
 
         for child in children:
             if child.dep in SUBJ_DEPS:
-                span_texts = _collect_span(tokens, child.index)
-                subject_span = span_texts
+                subject_child = child
+                subject_span = _collect_span(tokens, child.index)
                 subject_lemma = child.lemma
             elif child.dep in OBJ_DEPS and child.dep not in COMP_DEPS:
-                span_texts = _collect_span(tokens, child.index)
-                object_span = span_texts
+                object_child = child
+                object_span = _collect_span(tokens, child.index)
                 object_lemma = child.lemma
 
-        # Only emit a claim if we have at least a subject or an object
+        if predicate.head == 0 and predicate.pos in PREDICATE_ROOT_POS and not subject_span:
+            # Copular / attributive roots without a clear subject are usually
+            # not useful claim frames on their own.
+            continue
+
         if not subject_span and not object_span:
             continue
+
+        used_indices = {predicate.index}
+        if subject_child is not None:
+            used_indices.update(_collect_span_indices(tokens, subject_child.index))
+        if object_child is not None:
+            used_indices.update(_collect_span_indices(tokens, object_child.index))
+
+        # Qualifiers around the predicate (adverbials, complements, numeric/temporal modifiers)
+        qualifiers = _extract_qualifiers(tokens, predicate.index, used_indices)
+        # Also extract modifiers attached to subject/object (adjectival modifiers, nmod, prepositional phrases)
+        if subject_child is not None:
+            subj_quals = _extract_role_qualifiers(tokens, subject_child.index, used_indices)
+            qualifiers.extend([f"subj: {q}" for q in subj_quals])
+            # mark these indices as used so we don't duplicate
+            for q in subj_quals:
+                # collect indices for q's head (approximate)
+                pass
+        if object_child is not None:
+            obj_quals = _extract_role_qualifiers(tokens, object_child.index, used_indices)
+            qualifiers.extend([f"obj: {q}" for q in obj_quals])
+            for q in obj_quals:
+                pass
 
         claim = Claim(
             sentence_index=sentence.index,
             sentence_text=sentence.text,
             subject=" ".join(subject_span) if subject_span else None,
             subject_lemma=subject_lemma,
-            predicate=verb.text,
-            predicate_lemma=verb.lemma,
+            predicate=predicate.text,
+            predicate_lemma=predicate.lemma,
             object=" ".join(object_span) if object_span else None,
             object_lemma=object_lemma,
+            qualifiers=qualifiers,
             numerics=_extract_numerics(sentence.text),
             temporals=_extract_temporals(sentence.text),
             entities=_extract_entities(tokens),
         )
         claims.append(claim)
 
-    # If no verb was found, emit a minimal claim just for NE/numeric coverage
     if not claims:
         entities = _extract_entities(tokens)
         numerics = _extract_numerics(sentence.text)

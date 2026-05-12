@@ -20,9 +20,12 @@ Each detected contradiction is a ContradictionAlert with full explainability.
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
 from itertools import combinations
 from typing import List, Optional, Tuple
+
+from src.pipeline.embeddings import EmbeddingService
 
 logger = logging.getLogger(__name__)
 
@@ -104,7 +107,20 @@ def _shared_topic_word(a, b) -> Optional[str]:
     return next(iter(shared), None) if shared else None
 
 
-def _claims_are_related(a, b, require_evidence: bool = False) -> bool:
+def _claim_signature(claim) -> str:
+    parts = [claim.subject, claim.predicate, claim.object]
+    qualifiers = getattr(claim, "qualifiers", None) or []
+    parts.extend(qualifiers)
+    return " ".join(part.strip() for part in parts if part and part.strip())
+
+
+def _claims_are_related(
+    a,
+    b,
+    require_evidence: bool = False,
+    embedding_service: Optional[EmbeddingService] = None,
+    semantic_threshold: float = 0.72,
+) -> bool:
     """
     Return True if two claims are likely about the same event/entity.
 
@@ -126,6 +142,15 @@ def _claims_are_related(a, b, require_evidence: bool = False) -> bool:
             b_has_evidence = bool(b.numerics or b.temporals)
             return a_has_evidence and b_has_evidence
         return True
+
+    if embedding_service is not None:
+        return embedding_service.claims_are_semantically_related(
+            a,
+            b,
+            predicate_threshold=0.80,
+            sentence_threshold=semantic_threshold,
+        )
+
     return False
 
 
@@ -360,10 +385,20 @@ class ContradictionDetector:
         use_wordnet: bool = True,
         use_nli: bool = False,
         nli_threshold: float = 0.65,
+        use_semantic_similarity: bool = True,
+        semantic_threshold: float = 0.72,
     ):
         self.use_wordnet = use_wordnet
         self.use_nli = use_nli
         self.nli_threshold = nli_threshold
+        self.use_semantic_similarity = use_semantic_similarity
+        self.semantic_threshold = semantic_threshold
+        # Attempt to locate a local static embedding file; if present, pass it
+        project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        static_path = os.path.join(project_root, "data", "embeddings", "cc.ro.300.bin")
+        if not os.path.isfile(static_path):
+            static_path = None
+        self.embedding_service = EmbeddingService(use_bert=use_semantic_similarity, static_model_path=static_path)
 
     def detect(self, claims, norm_data: list) -> List[ContradictionAlert]:
         """
@@ -385,10 +420,18 @@ class ContradictionDetector:
             norm_a = norm_data[i]
             norm_b = norm_data[j]
 
+            if not _claims_are_related(
+                claim_a,
+                claim_b,
+                embedding_service=self.embedding_service if self.use_semantic_similarity else None,
+                semantic_threshold=self.semantic_threshold,
+            ):
+                continue
+
             # Layer 1a: deterministic numeric / temporal / entity rules
             alert = (
-                _check_numeric_contradiction(claim_a, claim_b, norm_a, norm_b)
-                or _check_temporal_contradiction(claim_a, claim_b, norm_a, norm_b)
+                _check_temporal_contradiction(claim_a, claim_b, norm_a, norm_b)
+                or _check_numeric_contradiction(claim_a, claim_b, norm_a, norm_b)
                 or _check_entity_contradiction(claim_a, claim_b)
             )
             if alert:
