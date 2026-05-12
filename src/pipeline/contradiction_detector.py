@@ -338,9 +338,9 @@ def _check_nli_contradiction(claim_a, claim_b, threshold: float = 0.65) -> Optio
     try:
         from src.pipeline.nli_module import get_default_scorer
         scorer = get_default_scorer(threshold=threshold)
-        is_contra, score = scorer.is_contradiction(
-            claim_a.sentence_text, claim_b.sentence_text
-        )
+        scores = scorer.score(claim_a.sentence_text, claim_b.sentence_text)
+        contradiction_score = scores.get("contradiction", 0.0)
+        is_contra = contradiction_score >= threshold
         if is_contra:
             return ContradictionAlert(
                 claim_a_index=claim_a.sentence_index,
@@ -350,9 +350,9 @@ def _check_nli_contradiction(claim_a, claim_b, threshold: float = 0.65) -> Optio
                 contradiction_type="LINGUISTIC",
                 explanation=(
                     f"Multilingual NLI model (XLM-RoBERTa) detected a linguistic "
-                    f"contradiction (confidence: {score:.2f})."
+                    f"contradiction (confidence: {contradiction_score:.2f})."
                 ),
-                confidence=score,
+                confidence=contradiction_score,
                 evidence_a=claim_a.sentence_text,
                 evidence_b=claim_b.sentence_text,
             )
@@ -415,6 +415,8 @@ class ContradictionDetector:
         List[ContradictionAlert]
         """
         alerts: List[ContradictionAlert] = []
+        wn_checked:  set = set()
+        nli_checked: set = set()
 
         for (i, claim_a), (j, claim_b) in combinations(enumerate(claims), 2):
             norm_a = norm_data[i]
@@ -438,18 +440,27 @@ class ContradictionDetector:
                 alerts.append(alert)
                 continue
 
-            # Layer 1b: WordNet antonymy / negated-synonym
+            # Layer 1b: WordNet antonymy / negated-synonym — once per sentence pair
             if self.use_wordnet:
-                wn_alert = _check_wordnet_contradiction(claim_a, claim_b)
-                if wn_alert:
-                    alerts.append(wn_alert)
-                    continue
+                sent_pair = (claim_a.sentence_index, claim_b.sentence_index)
+                if sent_pair not in wn_checked:
+                    wn_alert = _check_wordnet_contradiction(claim_a, claim_b)
+                    if wn_alert:
+                        wn_checked.add(sent_pair)
+                        alerts.append(wn_alert)
+                        continue
 
-            # Layer 2: NLI soft detection
+            # Layer 2: NLI soft detection — once per sentence pair.
+            # Only mark as checked if a contradiction IS found; otherwise let
+            # subsequent claim pairs from the same sentences retry, since the
+            # first claim pair might use a worse SPO representation.
             if self.use_nli:
-                nli_alert = _check_nli_contradiction(claim_a, claim_b, self.nli_threshold)
-                if nli_alert:
-                    alerts.append(nli_alert)
+                sent_pair = (claim_a.sentence_index, claim_b.sentence_index)
+                if sent_pair not in nli_checked:
+                    nli_alert = _check_nli_contradiction(claim_a, claim_b, self.nli_threshold)
+                    if nli_alert:
+                        nli_checked.add(sent_pair)
+                        alerts.append(nli_alert)
 
         return alerts
 
