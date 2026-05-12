@@ -108,22 +108,38 @@ def sentence_vector_static(text: str) -> Optional[np.ndarray]:
 
 _bert_tokenizer = None
 _bert_model = None
-_BERT_MODEL_ID = "xlm-roberta-base"
+
+# Reuse the NLI model as sentence encoder — already cached locally, fine-tuned
+# on multilingual NLI (incl. Romanian XNLI) so its embeddings capture semantic
+# meaning far better than a general-purpose xlm-roberta-base encoder.
+_NLI_MODEL_ID    = "MoritzLaurer/multilingual-MiniLMv2-L6-mnli-xnli"
+_NLI_CACHE       = os.path.join(PROJECT_ROOT, "models", "nli")
 
 
 def _get_bert():
+    """Return (tokenizer, encoder) — reuses the NLI model to avoid loading twice."""
     global _bert_tokenizer, _bert_model
-    if _bert_tokenizer is None:
-        from transformers import AutoTokenizer, AutoModel
-        logger.info("Loading Romanian BERT…")
-        _bert_tokenizer = AutoTokenizer.from_pretrained(
-            _BERT_MODEL_ID, cache_dir=BERT_CACHE
-        )
-        _bert_model = AutoModel.from_pretrained(
-            _BERT_MODEL_ID, cache_dir=BERT_CACHE
-        )
-        _bert_model.eval()
-        logger.info("Romanian BERT loaded.")
+    if _bert_model is not None:
+        return _bert_tokenizer, _bert_model
+
+    # Fast path: if the NLI scorer is already loaded, borrow its encoder
+    try:
+        from src.pipeline.nli_module import _default_scorer
+        if _default_scorer is not None and _default_scorer._model is not None:
+            _bert_tokenizer = _default_scorer._tokenizer
+            _bert_model     = _default_scorer._model.base_model
+            return _bert_tokenizer, _bert_model
+    except (ImportError, AttributeError):
+        pass
+
+    # Slow path: load independently (suppressing expected key-mismatch warnings)
+    from transformers import AutoTokenizer, AutoModel, logging as hf_logging
+    logger.info("Loading sentence encoder '%s'…", _NLI_MODEL_ID)
+    _bert_tokenizer = AutoTokenizer.from_pretrained(_NLI_MODEL_ID, cache_dir=_NLI_CACHE)
+    prev = hf_logging.get_verbosity()
+    hf_logging.set_verbosity_error()
+    _bert_model = AutoModel.from_pretrained(_NLI_MODEL_ID, cache_dir=_NLI_CACHE).eval()
+    hf_logging.set_verbosity(prev)
     return _bert_tokenizer, _bert_model
 
 
